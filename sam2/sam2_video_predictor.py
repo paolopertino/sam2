@@ -15,7 +15,6 @@ from tqdm import tqdm
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
-
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
 
@@ -45,6 +44,7 @@ class SAM2VideoPredictor(SAM2Base):
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
+        is_lidar=False,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
@@ -54,6 +54,7 @@ class SAM2VideoPredictor(SAM2Base):
             offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
+            is_lidar=is_lidar,
         )
         inference_state = {}
         inference_state["images"] = images
@@ -524,7 +525,7 @@ class SAM2VideoPredictor(SAM2Base):
                     if self.clear_non_cond_mem_around_input:
                         # clear non-conditioning memory of the surrounding frames
                         self._clear_obj_non_cond_mem_around_input(
-                            inference_state, frame_idx, obj_idx
+                            inference_state, frame_idx
                         )
 
                 # clear temporary outputs in `temp_output_dict_per_obj`
@@ -596,7 +597,7 @@ class SAM2VideoPredictor(SAM2Base):
                     if self.clear_non_cond_mem_around_input:
                         # clear non-conditioning memory of the surrounding frames
                         self._clear_obj_non_cond_mem_around_input(
-                            inference_state, frame_idx, obj_idx
+                            inference_state, frame_idx
                         )
                 else:
                     storage_key = "non_cond_frame_outputs"
@@ -953,7 +954,7 @@ class SAM2VideoPredictor(SAM2Base):
 
         return inference_state["obj_ids"], updated_frames
 
-    def _clear_non_cond_mem_around_input(self, inference_state, frame_idx):
+    def _clear_obj_non_cond_mem_around_input(self, inference_state, frame_idx):
         """
         Remove the non-conditioning memory around the input frame. When users provide
         correction clicks, the surrounding frames' non-conditioning memories can still

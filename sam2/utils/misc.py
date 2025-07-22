@@ -12,7 +12,8 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
-
+from scipy.ndimage import convolve1d
+from scipy.signal import firwin
 
 def get_sdpa_settings():
     if torch.cuda.is_available():
@@ -89,15 +90,43 @@ def mask_to_box(masks: torch.Tensor):
     return bbox_coords
 
 
-def _load_img_as_tensor(img_path, image_size):
-    img_pil = Image.open(img_path)
-    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
-    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+# def _load_img_as_tensor(img_path, image_size, is_lidar: bool = False):
+#     img_pil = Image.open(img_path)
+#     img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+#     # TODO: filtrare lidar images
+#     if is_lidar:
+#         img_np = artifact_filter(image, artifact_frequency=0.25, epsilon=0.04, taps=33)
+#     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
+#         img_np = img_np / 255.0
+#     else:
+#         raise RuntimeError(f"Unknown image dtype: {img_np.dtype} on {img_path}")
+#     img = torch.from_numpy(img_np).permute(2, 0, 1)
+#     video_width, video_height = img_pil.size  # the original video size
+#     return img, video_height, video_width
+
+def _load_img_as_tensor(img_path, image_size, is_lidar: bool = False):
+    img_pil = Image.open(img_path).convert("RGB")  # Convert to RGB first
+    img_np = np.array(img_pil)
+
+    # Apply LiDAR artifact filtering before resizing
+    if is_lidar:
+        img_np = artifact_filter(img_np, artifact_frequency=0.25, epsilon=0.04, taps=33)
+
+    # Now resize the filtered image
+    img_pil = Image.fromarray(np.clip(img_np, 0, 255).astype(np.uint8))  # Ensure valid image range and type
+    img_np = np.array(img_pil.resize((image_size, image_size)))
+
+    # Normalize
+    if img_np.dtype == np.uint8:
         img_np = img_np / 255.0
     else:
         raise RuntimeError(f"Unknown image dtype: {img_np.dtype} on {img_path}")
-    img = torch.from_numpy(img_np).permute(2, 0, 1)
-    video_width, video_height = img_pil.size  # the original video size
+
+    # Convert to torch tensor
+    img = torch.from_numpy(img_np).permute(2, 0, 1)  # CHW format
+
+    # Return original dimensions
+    video_width, video_height = img_pil.size
     return img, video_height, video_width
 
 
@@ -114,6 +143,7 @@ class AsyncVideoFrameLoader:
         img_mean,
         img_std,
         compute_device,
+        is_lidar=False,
     ):
         self.img_paths = img_paths
         self.image_size = image_size
@@ -128,6 +158,7 @@ class AsyncVideoFrameLoader:
         self.video_height = None
         self.video_width = None
         self.compute_device = compute_device
+        self.is_lidar = is_lidar
 
         # load the first frame to fill video_height and video_width and also
         # to cache it (since it's most likely where the user will click)
@@ -153,7 +184,7 @@ class AsyncVideoFrameLoader:
             return img
 
         img, video_height, video_width = _load_img_as_tensor(
-            self.img_paths[index], self.image_size
+            self.img_paths[index], self.image_size, is_lidar=self.is_lidar
         )
         self.video_height = video_height
         self.video_width = video_width
@@ -177,6 +208,7 @@ def load_video_frames(
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
+    is_lidar=False,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -203,6 +235,7 @@ def load_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
+            is_lidar=is_lidar,
         )
     else:
         raise NotImplementedError(
@@ -218,6 +251,7 @@ def load_video_frames_from_jpg_images(
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
+    is_lidar=False,
 ):
     """
     Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
@@ -243,9 +277,9 @@ def load_video_frames_from_jpg_images(
     frame_names = [
         p
         for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", '.png']
     ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    frame_names.sort(key=lambda p: os.path.splitext(p)[0])
     num_frames = len(frame_names)
     if num_frames == 0:
         raise RuntimeError(f"no images found in {jpg_folder}")
@@ -266,7 +300,7 @@ def load_video_frames_from_jpg_images(
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size, is_lidar=is_lidar)
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
@@ -347,3 +381,24 @@ def concat_points(old_point_inputs, new_points, new_labels):
         labels = torch.cat([old_point_inputs["point_labels"], new_labels], dim=1)
 
     return {"point_coords": points, "point_labels": labels}
+
+def artifact_filter(image, artifact_frequency, taps, epsilon, print_params=False):
+    image = np.asarray(image, float)
+    return image - lowpass(highpass(image, artifact_frequency, taps, epsilon, print_params), 
+                            taps, epsilon, print_params)
+
+
+def highpass(image, distortion_freq, taps, epsilon, print_params=False):
+    highpass_filter = firwin(taps, distortion_freq - epsilon, pass_zero='highpass', fs=1)
+    if print_params:
+        print("Highpass FIR Parameters:")
+        print(highpass_filter)
+    return convolve1d(image, highpass_filter, axis=0)
+
+
+def lowpass(image, taps, epsilon, print_params=False):
+    lowpass_filter = firwin(taps, epsilon, pass_zero='lowpass', fs=1)
+    if print_params:
+        print("Lowpass FIR Parameters:")
+        print(lowpass_filter)
+    return convolve1d(image, lowpass_filter, axis=1)

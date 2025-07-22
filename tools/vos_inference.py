@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor
+from tqdm import tqdm
 
 
 # the PNG palette for DAVIS 2017 dataset
@@ -31,8 +32,9 @@ def save_ann_png(path, mask, palette):
     assert mask.dtype == np.uint8
     assert mask.ndim == 2
     output_mask = Image.fromarray(mask)
-    output_mask.putpalette(palette)
+    # output_mask.putpalette(palette)
     output_mask.save(path)
+    print(f"Saved mask to {path}")
 
 
 def get_per_obj_mask(mask):
@@ -92,6 +94,7 @@ def save_masks_to_dir(
     output_palette,
 ):
     """Save masks to a directory as PNG files."""
+    print(f"Saving masks for {video_name} - {frame_name}...")
     os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
     if not per_obj_png_file:
         output_mask = put_per_obj_mask(per_obj_output_mask, height, width)
@@ -99,6 +102,7 @@ def save_masks_to_dir(
             output_mask_dir, video_name, f"{frame_name}.png"
         )
         save_ann_png(output_mask_path, output_mask, output_palette)
+        print(f"Saved combined mask to {output_mask_path}")
     else:
         for object_id, object_mask in per_obj_output_mask.items():
             object_name = f"{object_id:03d}"
@@ -131,11 +135,11 @@ def vos_inference(
     frame_names = [
         os.path.splitext(p)[0]
         for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", '.png']
     ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    frame_names.sort(key=lambda p: os.path.splitext(p)[0])
     inference_state = predictor.init_state(
-        video_path=video_dir, async_loading_frames=False
+        video_path=video_dir, async_loading_frames=False, offload_video_to_cpu=True
     )
     height = inference_state["video_height"]
     width = inference_state["video_width"]
@@ -255,6 +259,7 @@ def vos_separate_inference_per_object(
     score_thresh=0.0,
     use_all_masks=False,
     per_obj_png_file=False,
+    is_lidar=False,
 ):
     """
     Run VOS inference on a single video with the given predictor.
@@ -269,11 +274,11 @@ def vos_separate_inference_per_object(
     frame_names = [
         os.path.splitext(p)[0]
         for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", '.png']
     ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    frame_names.sort(key=lambda p: os.path.splitext(p)[0])
     inference_state = predictor.init_state(
-        video_path=video_dir, async_loading_frames=False
+        video_path=video_dir, async_loading_frames=False, is_lidar=is_lidar
     )
     height = inference_state["video_height"]
     width = inference_state["video_width"]
@@ -325,12 +330,15 @@ def vos_separate_inference_per_object(
         ):
             obj_scores = out_mask_logits.cpu().numpy()
             output_scores_per_object[object_id][out_frame_idx] = obj_scores
+        print(f"completed VOS inference for {object_id}")
 
     # post-processing: consolidate the per-object scores into per-frame masks
+    print("Creating output folder...")
     os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
     output_palette = input_palette or DAVIS_PALETTE
     video_segments = {}  # video_segments contains the per-frame segmentation results
-    for frame_idx in range(len(frame_names)):
+    print("Starting post-processing...")
+    for frame_idx in tqdm(range(len(frame_names)), desc="Post Processing..."):
         scores = torch.full(
             size=(len(object_ids), 1, height, width),
             fill_value=-1024.0,
@@ -348,10 +356,7 @@ def vos_separate_inference_per_object(
             object_id: (scores[i] > score_thresh).cpu().numpy()
             for i, object_id in enumerate(object_ids)
         }
-        video_segments[frame_idx] = per_obj_output_mask
-
-    # write the output masks as palette PNG files to output_mask_dir
-    for frame_idx, per_obj_output_mask in video_segments.items():
+        # video_segments[frame_idx] = per_obj_output_mask
         save_masks_to_dir(
             output_mask_dir=output_mask_dir,
             video_name=video_name,
@@ -362,6 +367,24 @@ def vos_separate_inference_per_object(
             per_obj_png_file=per_obj_png_file,
             output_palette=output_palette,
         )
+        
+        # Explicitly free memory
+        del scores
+        del per_obj_output_mask
+        torch.cuda.empty_cache()
+
+    # write the output masks as palette PNG files to output_mask_dir
+    # for frame_idx, per_obj_output_mask in video_segments.items():
+    #     save_masks_to_dir(
+    #         output_mask_dir=output_mask_dir,
+    #         video_name=video_name,
+    #         frame_name=frame_names[frame_idx],
+    #         per_obj_output_mask=per_obj_output_mask,
+    #         height=height,
+    #         width=width,
+    #         per_obj_png_file=per_obj_png_file,
+    #         output_palette=output_palette,
+    #     )
 
 
 def main():
@@ -439,6 +462,21 @@ def main():
         action="store_true",
         help="whether to use vos optimized video predictor with all modules compiled",
     )
+    parser.add_argument(
+        "--is_lidar",
+        action="store_true",
+        help="whether the input image is a lidar image",
+    )
+    parser.add_argument(
+        "--clear_non_cond_mem_around_input",
+        action="store_true",
+        help="whether to clear non-conditional memory around the input frame (default: False)",
+    )
+    parser.add_argument(
+        "--add_all_frames_to_correct_as_cond",
+        action="store_true",
+        help="whether to add all frames to the conditional memory (default: False)",
+    )
     args = parser.parse_args()
 
     # if we use per-object PNG files, they could possibly overlap in inputs and outputs
@@ -452,6 +490,9 @@ def main():
         hydra_overrides_extra=hydra_overrides_extra,
         vos_optimized=args.use_vos_optimized_video_predictor,
     )
+    predictor.clear_non_cond_mem_around_input = args.clear_non_cond_mem_around_input
+    predictor.clear_non_cond_mem_for_multi_obj = args.clear_non_cond_mem_around_input
+    predictor.add_all_frames_to_correct_as_cond = args.add_all_frames_to_correct_as_cond
 
     if args.use_all_masks:
         print("using all available masks in input_mask_dir as input to the SAM 2 model")
@@ -495,6 +536,7 @@ def main():
                 score_thresh=args.score_thresh,
                 use_all_masks=args.use_all_masks,
                 per_obj_png_file=args.per_obj_png_file,
+                is_lidar=args.is_lidar,
             )
 
     print(
