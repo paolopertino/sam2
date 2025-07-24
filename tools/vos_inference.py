@@ -6,6 +6,7 @@
 
 import argparse
 import os
+import shutil
 from collections import defaultdict
 
 import numpy as np
@@ -247,6 +248,82 @@ def vos_inference(
             output_palette=output_palette,
         )
 
+def chunk_files_by_reference(folder_a, folder_b):
+    """
+    Chunks files in folder_a into subdirectories based on the order of base names in folder_b.
+    Files are matched by name only (ignoring extensions).
+    Each chunk starts from a reference file in B and ends before the next reference.
+    """
+    # Get sorted list of files in A and B
+    files_a = sorted(os.listdir(folder_a))
+    files_b = sorted(os.listdir(folder_b))
+
+    # Map base name (no extension) of files in A to their index
+    index_map = {
+        os.path.splitext(f)[0]: i
+        for i, f in enumerate(files_a)
+    }
+
+    # Extract base names from files in B
+    base_names_b = [os.path.splitext(f)[0] for f in files_b]
+
+    # Build list of (base_name, index_in_A) tuples, keeping only those that exist in A
+    sorted_refs = sorted(
+        [(name, index_map[name]) for name in base_names_b if name in index_map],
+        key=lambda x: x[1]
+    )
+
+    if not sorted_refs:
+        print("No matching reference files found in folder A.")
+        return
+
+    # Prepare chunk ranges using the sorted indices
+    chunk_ranges = []
+    print(f"Chunking {len(sorted_refs)} reference files into {len(files_a)} files in '{folder_a}'")
+
+    for i in range(len(sorted_refs)):
+        start_idx = sorted_refs[i][1]
+        end_idx = sorted_refs[i + 1][1] if i + 1 < len(sorted_refs) else len(files_a)
+        chunk_files = files_a[start_idx:end_idx]
+        chunk_ranges.append((sorted_refs[i][0], chunk_files))
+
+    # Move files into corresponding subdirectories
+    for base_name, chunk in chunk_ranges:
+        chunk_dir = os.path.join(folder_a, base_name.split('_')[-1])  # Use trailing index as folder name
+        os.makedirs(chunk_dir, exist_ok=True)
+        for f in chunk:
+            src = os.path.join(folder_a, f)
+            dst = os.path.join(chunk_dir, f)
+            shutil.move(src, dst)
+        print(f"Moved {len(chunk)} files to '{chunk_dir}'")
+
+def flatten_folder(folder_a):
+    """
+    Move all files from subdirectories in folder_a back to folder_a and remove subdirectories.
+    """
+    # Iterate over items in A
+    for item in os.listdir(folder_a):
+        item_path = os.path.join(folder_a, item)
+        print(f"Processing item: {item_path}")
+        # Skip if not a directory
+        if not os.path.isdir(item_path):
+            continue
+
+        # Move all files from subdir to A
+        for f in os.listdir(item_path):
+            src_path = os.path.join(item_path, f)
+            dst_path = os.path.join(folder_a, f)
+
+            if os.path.exists(dst_path):
+                raise FileExistsError(f"Target file already exists: {dst_path}")
+
+            shutil.move(src_path, dst_path)
+
+        # Remove the now-empty directory
+        os.rmdir(item_path)
+        print(f"Removed folder: {item_path}")
+
+    print(f"All files have been moved back to {folder_a}")
 
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -271,107 +348,118 @@ def vos_separate_inference_per_object(
     """
     # load the video frames and initialize the inference state on this video
     video_dir = os.path.join(base_video_dir, video_name)
-    frame_names = [
-        os.path.splitext(p)[0]
-        for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", '.png']
-    ]
-    frame_names.sort(key=lambda p: os.path.splitext(p)[0])
-    inference_state = predictor.init_state(
-        video_path=video_dir, async_loading_frames=False, is_lidar=is_lidar
-    )
-    height = inference_state["video_height"]
-    width = inference_state["video_width"]
-    input_palette = None
+    
+    # Run the chunking if it has not already been done
+    if all(os.path.isdir(os.path.join(video_dir, subdir)) for subdir in os.listdir(video_dir)):
+        print("Chunking has already been done, skipping...")
+    else:
+        print("Chunking files by reference...")
+        chunk_files_by_reference(video_dir, os.path.join(input_mask_dir, video_name))
 
-    # collect all the object ids and their input masks
-    inputs_per_object = defaultdict(dict)
-    for idx, name in enumerate(frame_names):
-        if per_obj_png_file or os.path.exists(
-            os.path.join(input_mask_dir, video_name, f"{name}.png")
-        ):
-            per_obj_input_mask, input_palette = load_masks_from_dir(
-                input_mask_dir=input_mask_dir,
-                video_name=video_name,
-                frame_name=frame_names[idx],
-                per_obj_png_file=per_obj_png_file,
-                allow_missing=True,
-            )
-            for object_id, object_mask in per_obj_input_mask.items():
-                # skip empty masks
-                if not np.any(object_mask):
-                    continue
-                # if `use_all_masks=False`, we only use the first mask for each object
-                if len(inputs_per_object[object_id]) > 0 and not use_all_masks:
-                    continue
-                print(f"adding mask from frame {idx} as input for {object_id=}")
-                inputs_per_object[object_id][idx] = object_mask
-
-    # run inference separately for each object in the video
-    object_ids = sorted(inputs_per_object)
-    output_scores_per_object = defaultdict(dict)
-    for object_id in object_ids:
-        # add those input masks to SAM 2 inference state before propagation
-        input_frame_inds = sorted(inputs_per_object[object_id])
-        predictor.reset_state(inference_state)
-        for input_frame_idx in input_frame_inds:
-            predictor.add_new_mask(
-                inference_state=inference_state,
-                frame_idx=input_frame_idx,
-                obj_id=object_id,
-                mask=inputs_per_object[object_id][input_frame_idx],
-            )
-
-        # run propagation throughout the video and collect the results in a dict
-        for out_frame_idx, _, out_mask_logits in predictor.propagate_in_video(
-            inference_state,
-            start_frame_idx=min(input_frame_inds),
-            reverse=False,
-        ):
-            obj_scores = out_mask_logits.cpu().numpy()
-            output_scores_per_object[object_id][out_frame_idx] = obj_scores
-        print(f"completed VOS inference for {object_id}")
-
-    # post-processing: consolidate the per-object scores into per-frame masks
-    print("Creating output folder...")
-    os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
-    output_palette = input_palette or DAVIS_PALETTE
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    print("Starting post-processing...")
-    for frame_idx in tqdm(range(len(frame_names)), desc="Post Processing..."):
-        scores = torch.full(
-            size=(len(object_ids), 1, height, width),
-            fill_value=-1024.0,
-            dtype=torch.float32,
+    for subdir in os.listdir(video_dir):
+        frame_names = [
+            os.path.splitext(p)[0]
+            for p in os.listdir(os.path.join(video_dir, subdir))
+            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", '.png']
+        ]
+        frame_names.sort(key=lambda p: os.path.splitext(p)[0])
+        inference_state = predictor.init_state(
+            video_path=os.path.join(video_dir, subdir), async_loading_frames=False, is_lidar=is_lidar
         )
-        for i, object_id in enumerate(object_ids):
-            if frame_idx in output_scores_per_object[object_id]:
-                scores[i] = torch.from_numpy(
-                    output_scores_per_object[object_id][frame_idx]
+        height = inference_state["video_height"]
+        width = inference_state["video_width"]
+        input_palette = None
+
+        # collect all the object ids and their input masks
+        inputs_per_object = defaultdict(dict)
+        for idx, name in enumerate(frame_names):
+            if per_obj_png_file or os.path.exists(
+                os.path.join(input_mask_dir, video_name, f"{name}.png")
+            ):
+                per_obj_input_mask, input_palette = load_masks_from_dir(
+                    input_mask_dir=input_mask_dir,
+                    video_name=video_name,
+                    frame_name=frame_names[idx],
+                    per_obj_png_file=per_obj_png_file,
+                    allow_missing=True,
+                )
+                for object_id, object_mask in per_obj_input_mask.items():
+                    # skip empty masks
+                    if not np.any(object_mask):
+                        continue
+                    # if `use_all_masks=False`, we only use the first mask for each object
+                    if len(inputs_per_object[object_id]) > 0 and not use_all_masks:
+                        continue
+                    print(f"adding mask from frame {idx} as input for {object_id=}")
+                    inputs_per_object[object_id][idx] = object_mask
+
+        # run inference separately for each object in the video
+        object_ids = sorted(inputs_per_object)
+        output_scores_per_object = defaultdict(dict)
+        for object_id in object_ids:
+            # add those input masks to SAM 2 inference state before propagation
+            input_frame_inds = sorted(inputs_per_object[object_id])
+            predictor.reset_state(inference_state)
+            for input_frame_idx in input_frame_inds:
+                predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=input_frame_idx,
+                    obj_id=object_id,
+                    mask=inputs_per_object[object_id][input_frame_idx],
                 )
 
-        if not per_obj_png_file:
-            scores = predictor._apply_non_overlapping_constraints(scores)
-        per_obj_output_mask = {
-            object_id: (scores[i] > score_thresh).cpu().numpy()
-            for i, object_id in enumerate(object_ids)
-        }
-        # video_segments[frame_idx] = per_obj_output_mask
-        save_masks_to_dir(
-            output_mask_dir=output_mask_dir,
-            video_name=video_name,
-            frame_name=frame_names[frame_idx],
-            per_obj_output_mask=per_obj_output_mask,
-            height=height,
-            width=width,
-            per_obj_png_file=per_obj_png_file,
-            output_palette=output_palette,
-        )
-        
-        # Explicitly free memory
-        del scores
-        del per_obj_output_mask
-        torch.cuda.empty_cache()
+            # run propagation throughout the video and collect the results in a dict
+            for out_frame_idx, _, out_mask_logits in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=min(input_frame_inds),
+                reverse=False,
+            ):
+                obj_scores = out_mask_logits.cpu().numpy()
+                output_scores_per_object[object_id][out_frame_idx] = obj_scores
+            print(f"completed VOS inference for {object_id}")
+
+        # post-processing: consolidate the per-object scores into per-frame masks
+        print("Creating output folder...")
+        os.makedirs(os.path.join(output_mask_dir, video_name), exist_ok=True)
+        output_palette = input_palette or DAVIS_PALETTE
+        video_segments = {}  # video_segments contains the per-frame segmentation results
+        print("Starting post-processing...")
+        for frame_idx in tqdm(range(len(frame_names)), desc="Post Processing..."):
+            scores = torch.full(
+                size=(len(object_ids), 1, height, width),
+                fill_value=-1024.0,
+                dtype=torch.float32,
+            )
+            for i, object_id in enumerate(object_ids):
+                if frame_idx in output_scores_per_object[object_id]:
+                    scores[i] = torch.from_numpy(
+                        output_scores_per_object[object_id][frame_idx]
+                    )
+
+            if not per_obj_png_file:
+                scores = predictor._apply_non_overlapping_constraints(scores)
+            per_obj_output_mask = {
+                object_id: (scores[i] > score_thresh).cpu().numpy()
+                for i, object_id in enumerate(object_ids)
+            }
+            # video_segments[frame_idx] = per_obj_output_mask
+            save_masks_to_dir(
+                output_mask_dir=output_mask_dir,
+                video_name=video_name,
+                frame_name=frame_names[frame_idx],
+                per_obj_output_mask=per_obj_output_mask,
+                height=height,
+                width=width,
+                per_obj_png_file=per_obj_png_file,
+                output_palette=output_palette,
+            )
+            
+            # Explicitly free memory
+            del scores
+            del per_obj_output_mask
+            torch.cuda.empty_cache()
+        predictor.reset_state(inference_state)
+    flatten_folder(os.path.join(base_video_dir, video_name))
 
     # write the output masks as palette PNG files to output_mask_dir
     # for frame_idx, per_obj_output_mask in video_segments.items():
