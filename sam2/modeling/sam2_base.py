@@ -898,6 +898,11 @@ class SAM2Base(torch.nn.Module):
             return pred_masks
 
         device = pred_masks.device
+
+        # If there are no objects in the batch, return the empty tensor
+        if pred_masks.numel() == 0:
+            return pred_masks
+        
         # "max_obj_inds": object index of the object with the highest score at each location
         max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
         # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
