@@ -49,8 +49,7 @@ def get_per_obj_mask(mask):
 def put_per_obj_mask(per_obj_mask, height, width):
     """Combine per-object masks into a single mask."""
     mask = np.zeros((height, width), dtype=np.uint8)
-    object_ids = sorted(per_obj_mask)[::-1]
-    print(object_ids)
+    object_ids = sorted(per_obj_mask) # [::-1] The order of object_ids matters for the output mask (in our case)
     for object_id in object_ids:
         object_mask = per_obj_mask[object_id]
         object_mask = object_mask.reshape(height, width)
@@ -612,9 +611,6 @@ def main():
 
     for n_video, video_name in enumerate(video_names):
         print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
-        if '20250625_Brescia_NIR' in video_name or '20250625_Brescia_REFLEC' in video_name:
-            print("Skipping video 20250625_Brescia_NIR")
-            continue
         if not args.track_object_appearing_later_in_video:
             vos_inference(
                 predictor=predictor,
